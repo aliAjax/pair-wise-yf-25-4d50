@@ -10,11 +10,12 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = BASE_DIR / "review.db"
 VALID_DECISIONS = {"accept", "reject", "minor_revision", "major_revision"}
+PAPER_STATUSES = {"submitted", "under_review", "decided", "withdrawn"}
 
 
 class BusinessError(Exception):
@@ -91,7 +92,7 @@ class ReviewStore:
                     paper_id INTEGER NOT NULL REFERENCES papers(id),
                     reviewer_id TEXT NOT NULL REFERENCES users(id),
                     status TEXT NOT NULL DEFAULT 'invited'
-                        CHECK (status IN ('invited','accepted','declined','completed')),
+                        CHECK (status IN ('invited','accepted','declined','completed','canceled')),
                     score INTEGER CHECK (score IS NULL OR score BETWEEN 1 AND 5),
                     review_text TEXT,
                     created_at TEXT NOT NULL,
@@ -111,6 +112,13 @@ class ReviewStore:
                     decision TEXT NOT NULL CHECK (decision IN ('accept','reject','minor_revision','major_revision')),
                     note TEXT NOT NULL DEFAULT '',
                     decided_by TEXT NOT NULL REFERENCES users(id),
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS withdrawals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    paper_id INTEGER NOT NULL UNIQUE REFERENCES papers(id),
+                    author_id TEXT NOT NULL REFERENCES users(id),
+                    reason TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS audit_log (
@@ -193,20 +201,34 @@ class ReviewStore:
             data["author_id"] = None  # 双盲：评审人看不到作者身份。
         return data
 
-    def list_papers(self, user_id: str) -> list[dict]:
+    def list_papers(self, user_id: str, status: str | None = None) -> list[dict]:
+        if status is not None:
+            status = status.strip()
+            if status not in PAPER_STATUSES:
+                raise BusinessError("不支持的论文状态筛选", 422, "invalid_status")
         with self.connect() as conn:
             user = self._user(conn, user_id)
+            where = "WHERE p.status=?" if status else ""
+            params: list = [status] if status else []
             if user["role"] == "chair":
-                rows = conn.execute("SELECT * FROM papers ORDER BY id").fetchall()
+                rows = conn.execute(f"SELECT * FROM papers p {where} ORDER BY p.id", params).fetchall()
             elif user["role"] == "author":
-                rows = conn.execute("SELECT * FROM papers WHERE author_id=? ORDER BY id", (user_id,)).fetchall()
+                clause = "WHERE p.author_id=?"
+                args: list = [user_id]
+                if status:
+                    clause += " AND p.status=?"
+                    args.append(status)
+                rows = conn.execute(f"SELECT * FROM papers p {clause} ORDER BY p.id", args).fetchall()
             else:
+                clause = """WHERE a.id IS NOT NULL OR b.paper_id IS NOT NULL"""
+                if status:
+                    clause = f"p.status=? AND ({clause})"
                 rows = conn.execute(
-                    """SELECT p.* FROM papers p
+                    f"""SELECT DISTINCT p.* FROM papers p
                        LEFT JOIN assignments a ON a.paper_id=p.id AND a.reviewer_id=?
                        LEFT JOIN bids b ON b.paper_id=p.id AND b.reviewer_id=?
-                       WHERE a.id IS NOT NULL OR b.paper_id IS NOT NULL ORDER BY p.id""",
-                    (user_id, user_id),
+                       {clause} ORDER BY p.id""",
+                    [user_id, user_id] + params,
                 ).fetchall()
             return [self._paper_view(conn, row, user) for row in rows]
 
@@ -365,8 +387,12 @@ class ReviewStore:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
-                if not paper or paper["status"] not in {"submitted", "under_review"}:
-                    raise BusinessError("论文不存在或已经决定", 409, "paper_decided")
+                if not paper:
+                    raise BusinessError("论文不存在", 404, "not_found")
+                if paper["status"] == "withdrawn":
+                    raise BusinessError("论文已撤回，不能作决定", 409, "paper_withdrawn")
+                if paper["status"] == "decided":
+                    raise BusinessError("论文已经决定", 409, "paper_decided")
                 completed = conn.execute("SELECT COUNT(*) FROM assignments WHERE paper_id=? AND status='completed'", (paper_id,)).fetchone()[0]
                 if completed < 2:
                     raise BusinessError("至少需要两份已完成评审才能作出决定", 409, "insufficient_reviews")
@@ -374,9 +400,73 @@ class ReviewStore:
                     "INSERT INTO decisions(paper_id,decision,note,decided_by,created_at) VALUES(?,?,?,?,?)",
                     (paper_id, decision, note.strip(), chair_id, utcnow()),
                 )
-                conn.execute("UPDATE papers SET status='decided' WHERE id=?", (paper_id,))
+                # 条件更新作为最终冲突判定：与撤稿并发时只有一方能成功。
+                changed = conn.execute(
+                    "UPDATE papers SET status='decided' WHERE id=? AND status IN ('submitted','under_review')",
+                    (paper_id,),
+                ).rowcount
+                if changed == 0:
+                    raise BusinessError("论文状态刚被改变（可能已撤回）", 409, "paper_conflict")
                 self._audit(conn, paper_id, chair_id, "decision.record", {"decision": decision, "note": note.strip()})
                 return {"id": cur.lastrowid, "paper_id": paper_id, "decision": decision, "note": note.strip()}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def withdraw_paper(self, author_id: str, paper_id: int, reason: str) -> dict:
+        reason = reason.strip()
+        if len(reason) < 5:
+            raise BusinessError("撤稿原因至少 5 字", 422, "invalid_reason")
+        with self.connect() as conn:
+            author = self._user(conn, author_id)
+            self._require(author, "author")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
+                if not paper:
+                    raise BusinessError("论文不存在", 404, "not_found")
+                if paper["author_id"] != author_id:
+                    raise BusinessError("作者只能撤回自己的论文", 403, "forbidden")
+                if paper["status"] == "withdrawn":
+                    raise BusinessError("论文已经撤回", 409, "already_withdrawn")
+                if paper["status"] == "decided":
+                    raise BusinessError("论文已经决定，不能撤回", 409, "paper_decided")
+                # 条件更新作为最终冲突判定：与主席决定并发时只有一方能成功。
+                changed = conn.execute(
+                    "UPDATE papers SET status='withdrawn' WHERE id=? AND status IN ('submitted','under_review')",
+                    (paper_id,),
+                ).rowcount
+                if changed == 0:
+                    raise BusinessError("论文状态刚被改变（可能已决定）", 409, "paper_conflict")
+                try:
+                    cur = conn.execute(
+                        "INSERT INTO withdrawals(paper_id,author_id,reason,created_at) VALUES(?,?,?,?)",
+                        (paper_id, author_id, reason, utcnow()),
+                    )
+                except sqlite3.IntegrityError:
+                    raise BusinessError("论文已经撤回", 409, "already_withdrawn")
+                # 未处理邀请与已接受但未完成的分配一律取消，已完成意见原样保留。
+                pending = conn.execute(
+                    "SELECT id,reviewer_id FROM assignments WHERE paper_id=? AND status IN ('invited','accepted')",
+                    (paper_id,),
+                ).fetchall()
+                conn.execute(
+                    "UPDATE assignments SET status='canceled',updated_at=? WHERE paper_id=? AND status IN ('invited','accepted')",
+                    (utcnow(), paper_id),
+                )
+                for assignment in pending:
+                    self._audit(
+                        conn, paper_id, author_id, "assignment.cancel",
+                        {"assignment_id": assignment["id"], "reviewer_id": assignment["reviewer_id"], "reason": "paper_withdrawn"},
+                    )
+                self._audit(conn, paper_id, author_id, "paper.withdraw", {"reason": reason})
+                return {
+                    "id": cur.lastrowid,
+                    "paper_id": paper_id,
+                    "status": "withdrawn",
+                    "reason": reason,
+                    "canceled_assignments": [row["id"] for row in pending],
+                }
             except Exception:
                 conn.rollback()
                 raise
@@ -417,6 +507,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
     def _dispatch(self, method: str) -> None:
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
+        query = parse_qs(parsed.query)
         if method == "GET" and path == "/":
             html = (BASE_DIR / "web" / "index.html").read_bytes()
             self.send_response(200)
@@ -432,7 +523,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
         if not parts or parts[0] != "api":
             raise BusinessError("接口不存在", 404, "not_found")
         if parts == ["api", "papers"] and method == "GET":
-            return self._send(200, {"items": store.list_papers(self._user_id())})
+            status_filter = query.get("status", [None])[0]
+            return self._send(200, {"items": store.list_papers(self._user_id(), status_filter)})
         if parts == ["api", "papers"] and method == "POST":
             data = self._body()
             return self._send(201, store.submit_paper(self._user_id(), data.get("title", ""), data.get("abstract", "")))
@@ -455,6 +547,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[3] == "decision" and method == "POST":
                 data = self._body()
                 return self._send(201, store.decide(self._user_id(), paper_id, data.get("decision", ""), data.get("note", "")))
+            if len(parts) == 4 and parts[3] == "withdrawal" and method == "POST":
+                data = self._body()
+                return self._send(201, store.withdraw_paper(self._user_id(), paper_id, data.get("reason", "")))
             if len(parts) == 4 and parts[3] == "history" and method == "GET":
                 return self._send(200, {"items": store.history(self._user_id(), paper_id)})
         if len(parts) == 4 and parts[:2] == ["api", "assignments"] and method == "POST":
