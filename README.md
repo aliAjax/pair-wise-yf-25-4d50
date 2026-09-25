@@ -20,7 +20,8 @@ python -m unittest -v
 演示用户：`alice`、`bob`（作者），`r1`、`r2`、`r3`（评审人），`chair`（主席）。所有 API 请求应带 `X-User-Id` 请求头。
 
 - `POST /api/papers`：提交论文。
-- `GET /api/papers` / `GET /api/papers/{id}`：按角色隔离查看；评审人看到双盲视图。
+- `GET /api/papers` / `GET /api/papers/{id}`：按角色隔离查看；评审人看到双盲视图。列表支持 `?status=` 筛选（如主席用 `?status=withdrawn` 筛出已撤回论文）。
+- `POST /api/papers/{id}/withdraw`：作者在决定前撤稿，必须填写原因；未完成的邀请自动取消并释放评审负载，已完成评审与审计时间线保留。
 - `POST /api/papers/{id}/bids`：评审意向。
 - `POST /api/papers/{id}/conflicts`：主席登记利益冲突。
 - `POST /api/papers/{id}/assignments`：主席邀请评审人，执行负载上限与冲突检查。
@@ -32,4 +33,4 @@ python -m unittest -v
 
 ## 业务不变量
 
-评审人不能查看未分配论文的作者身份；利益冲突禁止投标和分配；邀请和完成状态不能跳步；每位评审人的未完成分配受 `load_limit` 限制；每篇论文只能提交一次 Rebuttal；决定必须至少基于两份已完成评审。
+评审人不能查看未分配论文的作者身份；利益冲突禁止投标和分配；邀请和完成状态不能跳步；每位评审人的未完成分配受 `load_limit` 限制；每篇论文只能提交一次 Rebuttal；决定必须至少基于两份已完成评审；撤稿仅作者本人且在决定之前，撤稿与决定互斥（并发时只有一个成功，另一个返回 409）。
